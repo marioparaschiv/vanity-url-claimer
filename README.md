@@ -11,4 +11,4 @@ Listens for vanity changes on configured alt accounts and attempts to snipe them
 - Run the binary when you are done modifying the configuration.
 
 # Prerequisite(s)
-- Go (https://go.dev/doc/install) **Only for building**
+- [Go](https://go.dev/doc/install) **Only for building**
