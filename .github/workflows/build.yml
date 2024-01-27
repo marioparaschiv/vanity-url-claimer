@@ -1,0 +1,40 @@
+# workflow name
+name: Build
+
+# on events
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        description: Package version
+        required: true
+
+# workflow tasks
+jobs:
+  build:
+    name: Generate cross-platform builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+
+      - name: Generate build files
+        uses: thatisuday/go-cross-build@v1
+        with:
+            platforms: 'linux/amd64, darwin/amd64, windows/amd64'
+            package: 'main'
+            name: 'vanity-sniper'
+            compress: 'true'
+            dest: 'dist'
+
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/**"
+          tag: ${{ inputs.version }}
