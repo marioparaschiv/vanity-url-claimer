@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	guilds             = map[string]string{}
-	clients            []func() error
+	guilds             = map[string]*Guild{}
+	sessions           = map[string]*Session{}
+	interrupt          = make(chan os.Signal)
 	guildsIndex        = 0
 	sameGuildIntervals = map[string]*time.Time{}
 )
@@ -28,27 +29,30 @@ var logger = log.NewWithOptions(os.Stderr, log.Options{
 func main() {
 	initializeConfig()
 
-	for _, token := range config.Tokens {
-		if token != "" {
-			disconnect := createClient(token)
-			clients = append(clients, disconnect)
-		}
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	for _, alt := range config.Tokens {
+		session := createClient(alt)
+		sessions[session.Token] = session
 	}
 
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	<-sc
+	for _, session := range sessions {
+		go session.Connect()
+	}
+
+	<-interrupt
 
 	exit()
 }
 
 func exit() {
-	if len(clients) > 0 {
-		logger.Infof("Exiting. Terminating %v clients.", len(clients))
-		for _, disconnect := range clients {
-			disconnect()
-		}
+	logger.Infof("Exiting. Terminating %v clients.", len(sessions))
+
+	for _, session := range sessions {
+		session.Close()
 	}
+
+	logger.Warnf("All connections terminated.")
 
 	os.Exit(0)
 }
@@ -67,4 +71,8 @@ func strip(content string, length int) string {
 	}
 
 	return content[0:length] + strings.Repeat("x", len(content)-length)
+}
+
+func RemoveIndex(s []int, index int) []int {
+	return append(s[:index], s[index+1:]...)
 }

@@ -6,123 +6,452 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/signal"
 	"slices"
+	"strconv"
+	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
 )
 
-func createClient(token string) func() error {
-	logger.Infof("Logging in with token: %v", strip(token, 30))
+func createClient(token string) (s *Session) {
+	session := &Session{
+		Token:    token,
+		Dialer:   websocket.DefaultDialer,
+		gateway:  "wss://gateway.discord.gg/?v=10&encoding=json",
+		sequence: new(int64),
+		Guilds:   map[string]*Guild{},
+		Vanities: map[string]string{},
+		C:        make(chan os.Signal),
+	}
 
-	dg, err := discordgo.New(token)
+	signal.Notify(session.C, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	build, err := strconv.Atoi(*clientBuildNumber)
 
 	if err != nil {
-		logger.Errorf("Failed to log in with %v: %v", strip(token, 30), err)
-		return func() error { return nil }
+		logger.Errorf("Failed to convert build number (%s) to string: %v.", *clientBuildNumber, err)
+		exit()
 	}
 
-	dg.AddHandler(ready)
-	dg.AddHandler(guildUpdate)
-	dg.AddHandler(guildCreate)
-	dg.AddHandler(guildDelete)
+	session.Identify.Token = token
 
-	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentDirectMessages
+	session.Identify.Properties.OS = config.Properties.OS
+	session.Identify.Properties.Browser = config.Properties.Browser
+	session.Identify.Properties.Device = config.Properties.Device
+	session.Identify.Properties.SystemLocale = config.Properties.SystemLocale
+	session.Identify.Properties.BrowserUserAgent = config.Properties.UserAgent
+	session.Identify.Properties.BrowserVersion = config.Properties.BrowserVersion
+	session.Identify.Properties.OSVersion = config.Properties.OSVersion
+	session.Identify.Properties.Referrer = config.Properties.Referrer
+	session.Identify.Properties.ReferringDomain = config.Properties.ReferringDomain
+	session.Identify.Properties.ReferrerCurrent = config.Properties.ReferrerCurrent
+	session.Identify.Properties.ReferringDomainCurrent = config.Properties.ReferringDomainCurrent
+	session.Identify.Properties.ReleaseChannel = config.Properties.ReleaseChannel
+	session.Identify.Properties.ClientBuildNumber = build
+	session.Identify.Properties.ClientEventSource = nil
 
-	err = dg.Open()
-
-	if err != nil {
-		logger.Errorf("Failed to open connection: %v", err)
-		return func() error { return nil }
-	}
-
-	return func() error {
-		return dg.Close()
-	}
+	return session
 }
 
-func ready(s *discordgo.Session, event *discordgo.Ready) {
-	logger.Infof("Logged in as %v with %v guilds.", event.User.Username, len(event.Guilds))
+func (session *Session) Connect() error {
+	var err error
 
-	for _, guild := range event.Guilds {
-		if guild.VanityURLCode != "" {
-			guilds[guild.ID] = guild.VanityURLCode
+	if session.websocket != nil {
+		return ErrWebsocketAlreadyConnected
+	}
+
+	logger.Infof("Connecting with %v...", strip(session.Token, 35))
+
+	header := http.Header{}
+	header.Add("Accept-Encoding", "json")
+
+	logger.Debugf("Connecting to %s", session.gateway)
+	session.websocket, _, err = session.Dialer.Dial(session.gateway, header)
+
+	if err != nil {
+		logger.Errorf("Failed to connect to websocket: %v", err)
+		session.websocket = nil
+
+		return err
+	}
+
+	defer session.Close()
+
+	session.websocket.SetCloseHandler(func(code int, text string) error {
+		session.State = "CLOSED"
+		session.C <- os.Interrupt
+
+		return nil
+	})
+
+	go func() {
+		for {
+			if session.State == "CLOSED" || session.State == "CLOSING" {
+				break
+			}
+
+			messageType, payload, err := session.websocket.ReadMessage()
+
+			if err != nil {
+				logger.Errorf("Received error while reading websocket message: %v", err)
+				continue
+			}
+
+			err = session.onEvent(messageType, payload)
+
+			if err != nil {
+				logger.Errorf("Received error while decoding event: %v", err)
+				continue
+			}
+		}
+	}()
+
+	<-session.C
+
+	return nil
+}
+
+func (session *Session) Close() error {
+	return session.CloseWithCode(websocket.CloseNormalClosure)
+}
+
+func (session *Session) CloseWithCode(code int) error {
+	session.State = "CLOSING"
+
+	err := session.websocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""))
+
+	if err == nil {
+		session.State = "CLOSED"
+		session.C <- os.Interrupt
+
+		delete(sessions, session.Token)
+
+		if len(sessions) == 0 {
+			interrupt <- os.Interrupt
+		}
+	} else {
+		session.State = "CONNECTED"
+	}
+
+	return err
+}
+
+func (session *Session) onEvent(messageType int, message []byte) error {
+	var err error
+
+	var data *Event
+	err = json.Unmarshal(message, &data)
+
+	if err != nil {
+		logger.Errorf("Error decoding websocket message: %v", err)
+		return err
+	}
+
+	atomic.StoreInt64(session.sequence, data.Sequence)
+
+	if data.Operation == DISPATCH {
+		if data.Type == "READY" {
+			session.State = "CONNECTED"
+			event := DispatchReadyEvent{}
+
+			if err = json.Unmarshal(data.RawData, &event); err != nil {
+				logger.Errorf("Failed to unmarshal HELLO payload: %v", err)
+				return err
+			}
+
+			for _, guild := range event.Guilds {
+				guilds[guild.ID] = &guild
+
+				if guild.VanityURLCode != "" {
+					logger.Infof("Queued %v for sniping. (Vanity: %v)", guild.Name, guild.VanityURLCode)
+					session.Vanities[guild.ID] = guild.VanityURLCode
+				}
+			}
+
+			logger.Infof("Logged in as %v watching %v vanities.", event.User.Username, len(session.Vanities))
+		}
+
+		if data.Type == "GUILD_CREATE" {
+			event := Guild{}
+
+			if err = json.Unmarshal(data.RawData, &event); err != nil {
+				logger.Errorf("Failed to unmarshal GUILD_CREATE payload: %v", err)
+				return err
+			}
+
+			if event.VanityURLCode != "" {
+				logger.Infof("Queued %v for sniping. (Vanity: %v)", event.Name, event.VanityURLCode)
+				session.Vanities[event.ID] = event.VanityURLCode
+			}
+		}
+
+		if data.Type == "GUILD_UPDATE" {
+			event := Guild{}
+
+			if err = json.Unmarshal(data.RawData, &event); err != nil {
+				logger.Errorf("Failed to unmarshal GUILD_UPDATE payload: %v", err)
+				return err
+			}
+
+			if event.Unavailable {
+				return nil
+			}
+
+			if config.IgnoreHostGuilds && slices.Contains(config.Guilds, event.ID) {
+				return nil
+			}
+
+			if event.VanityURLCode != session.Vanities[event.ID] {
+				_, exists := session.Vanities[event.ID]
+
+				if session.Vanities[event.ID] == "" {
+					return nil
+				}
+
+				logger.Infof("Vanity URL changed: %v -> %v", If(exists, session.Vanities[event.ID], "None"), If(event.VanityURLCode != "", event.VanityURLCode, "None"))
+
+				if config.SameGuildTimeout != 0 {
+					interval, existing := sameGuildIntervals[config.Guilds[guildsIndex]]
+
+					if existing {
+						difference := time.Until(*interval)
+
+						if difference > 0 {
+							logger.Warnf("Guild %v is on timeout for %.2fs. Ignoring vanity change.", config.Guilds[guildsIndex], difference.Seconds())
+							return nil
+						} else {
+							delete(sameGuildIntervals, config.Guilds[guildsIndex])
+						}
+					}
+				}
+
+				snipe(session.Vanities[event.ID], session.Token, 0)
+
+				session.Vanities[event.ID] = event.VanityURLCode
+			}
+		}
+
+		if data.Type == "GUILD_DELETE" {
+			event := Guild{}
+
+			if err = json.Unmarshal(data.RawData, &event); err != nil {
+				logger.Errorf("Failed to unmarshal GUILD_CREATE payload: %v", err)
+				return err
+			}
+
+			if event.VanityURLCode == "" {
+				return nil
+			}
+
+			if config.IgnoreHostGuilds && slices.Contains(config.Guilds, event.ID) {
+				return nil
+			}
+
+			logger.Infof("Guild %v was deleted. The vanity may be free: %v", guilds[event.ID].Name, event.VanityURLCode)
+			if config.SameGuildTimeout != 0 {
+				interval, existing := sameGuildIntervals[config.Guilds[guildsIndex]]
+
+				if existing {
+					difference := time.Until(*interval)
+
+					if difference > 0 {
+						logger.Warnf("Guild %v is on timeout for %.2fs. Ignoring guild deletion.", config.Guilds[guildsIndex], difference.Seconds())
+						return nil
+					} else {
+						delete(sameGuildIntervals, config.Guilds[guildsIndex])
+					}
+				}
+			}
+
+			snipe(event.VanityURLCode, session.Token, 0)
+		}
+
+		if data.Type == "RESUMED" {
+			logger.Infof("Logged in by resuming old session with %v guilds", len(guilds))
 		}
 	}
-}
 
-func guildCreate(s *discordgo.Session, event *discordgo.GuildCreate) {
-	if event.Guild.VanityURLCode != "" {
-		logger.Infof("Queued %v for sniping. (Vanity: %v)", event.Guild.Name, event.VanityURLCode)
-		guilds[event.Guild.ID] = event.Guild.VanityURLCode
+	if data.Operation == HEARTBEAT {
+		logger.Debugf("Sending heartbeat in response to heartbeat (Sequence: %v)", session.sequence)
+
+		err = session.websocket.WriteJSON(HeartbeatSendEvent{1, atomic.LoadInt64(session.sequence)})
+
+		if err != nil {
+			logger.Debugf("Failed to send heartbeat: %v", err)
+			return err
+		}
+
+		session.LastHeartbeatSent = time.Now().UTC()
+
+		return nil
 	}
+
+	if data.Operation == HELLO {
+		event := HelloEvent{}
+
+		if err = json.Unmarshal(data.RawData, &event); err != nil {
+			logger.Errorf("Failed to unmarshal HELLO payload: %v", err)
+			return err
+		}
+
+		milliseconds := event.HeartbeatInterval * time.Millisecond
+		session.heartbeatInterval = &milliseconds
+
+		sequence := atomic.LoadInt64(session.sequence)
+
+		session.LastHeartbeatAck = time.Now().UTC()
+
+		if session.sessionID == "" && sequence == 0 {
+			err = session.identify()
+
+			if err != nil {
+				logger.Errorf("Failed to identify to gateway: %v", err)
+				return err
+			}
+		} else {
+			err = session.resume(sequence)
+
+			if err != nil {
+				logger.Errorf("Failed to resume session: %v. Got error: %s", session.gateway, err)
+				return err
+			}
+		}
+
+		go session.heartbeat()
+	}
+
+	if data.Operation == HEARTBEAT_ACK {
+		session.LastHeartbeatAck = time.Now().UTC()
+		logger.Debugf("Heartbeat acknowledged.")
+	}
+
+	return nil
 }
 
-func guildUpdate(s *discordgo.Session, event *discordgo.GuildUpdate) {
-	if event.Guild.Unavailable {
+func (session *Session) heartbeat() {
+	if session.websocket == nil {
 		return
 	}
 
-	if config.IgnoreHostGuilds && slices.Contains(config.Guilds, event.ID) {
-		return
-	}
+	var err error
+	ticker := time.NewTicker(*session.heartbeatInterval)
+	defer ticker.Stop()
 
-	if event.VanityURLCode != guilds[event.ID] {
-		_, exists := guilds[event.ID]
-
-		if guilds[event.ID] == "" {
+	for {
+		if session.State == "CLOSED" || session.State == "CLOSING" {
 			return
 		}
 
-		logger.Infof("Vanity URL changed: %v -> %v", If(exists, guilds[event.ID], "None"), If(event.VanityURLCode != "", event.VanityURLCode, "None"))
+		lastHeartbeat := session.LastHeartbeatAck
+		sequence := atomic.LoadInt64(session.sequence)
 
-		if config.SameGuildTimeout != 0 {
-			interval, existing := sameGuildIntervals[config.Guilds[guildsIndex]]
+		logger.Debugf("Sending gateway websocket heartbeat (Sequence: %d)", sequence)
 
-			if existing {
-				difference := time.Until(*interval)
+		session.LastHeartbeatSent = time.Now().UTC()
+		payload := HeartbeatSendEvent{1, sequence}
+		err = session.websocket.WriteJSON(payload)
+		atomic.AddInt64(session.sequence, 1)
 
-				if difference > 0 {
-					logger.Warnf("Guild %v is on timeout for %.2fs. Ignoring vanity change.", config.Guilds[guildsIndex], difference.Seconds())
-					return
-				} else {
-					delete(sameGuildIntervals, config.Guilds[guildsIndex])
-				}
+		if err != nil || time.Now().UTC().Sub(lastHeartbeat) > ((*session.heartbeatInterval)*(FAILED_HEARTBEAT_ACKS)) {
+			if err != nil {
+				logger.Debugf("Encountered error while sending heartbeat: %s, attempting to reconnect.", err)
+			} else {
+				logger.Debugf("Haven't received a heartbeat ACK in %v, attempting to reconnect.", time.Now().UTC().Sub(lastHeartbeat))
 			}
+
+			session.Close()
+			session.reconnect()
+			return
 		}
 
-		snipe(guilds[event.ID], s.Token, 0)
-
-		guilds[event.ID] = event.VanityURLCode
+		select {
+		case <-session.C:
+			return
+		case <-ticker.C:
+			// continue loop and send heartbeat
+		}
 	}
 }
 
-func guildDelete(s *discordgo.Session, event *discordgo.GuildDelete) {
-	if event.VanityURLCode == "" {
-		return
-	}
+func (session *Session) reconnect() {
+	var err error
 
-	if config.IgnoreHostGuilds && slices.Contains(config.Guilds, event.ID) {
-		return
-	}
+	if session.ShouldReconnectOnError {
+		wait := time.Duration(1)
 
-	logger.Infof("Guild %v was deleted. The vanity may be free: %v", event.BeforeDelete.Name, event.VanityURLCode)
-	if config.SameGuildTimeout != 0 {
-		interval, existing := sameGuildIntervals[config.Guilds[guildsIndex]]
+		for {
+			logger.Info("Attempting to reconnect to gateway.")
 
-		if existing {
-			difference := time.Until(*interval)
-
-			if difference > 0 {
-				logger.Warnf("Guild %v is on timeout for %.2fs. Ignoring guild deletion.", config.Guilds[guildsIndex], difference.Seconds())
+			err = session.Connect()
+			if err == nil {
+				logger.Info("Successfully reconnected to gateway.")
 				return
-			} else {
-				delete(sameGuildIntervals, config.Guilds[guildsIndex])
+			}
+
+			if err == ErrWebsocketAlreadyConnected {
+				logger.Info("WebSocket already exists, no need to reconnect")
+				return
+			}
+
+			logger.Errorf("Failed to reconnect to gateway: %v", err)
+
+			<-time.After(wait * time.Second)
+			wait *= 2
+
+			if wait > 600 {
+				wait = 600
 			}
 		}
 	}
+}
 
-	snipe(event.VanityURLCode, s.Token, 0)
+func (session *Session) resume(sequence int64) error {
+	session.State = "RESUMING"
+
+	payload := ResumeEvent{}
+
+	payload.Op = 6
+	payload.Data.Token = session.Token
+	payload.Data.SessionID = session.sessionID
+	payload.Data.Sequence = sequence
+
+	logger.Infof("Attempting to resume session: %v", session.sessionID)
+
+	err := session.websocket.WriteJSON(payload)
+
+	if err != nil {
+		logger.Errorf("Failed to resume session: %v. Got error: %s", session.gateway, err)
+		return err
+	}
+
+	return nil
+}
+
+func (session *Session) identify() error {
+	session.State = "IDENTIFYING"
+
+	atomic.StoreInt64(session.sequence, 0)
+	session.sessionID = ""
+
+	payload := IdentifyEvent{}
+	payload.Op = 2
+	payload.Data = session.Identify
+
+	logger.Debug("Attempting to identify to gateway.")
+	err := session.websocket.WriteJSON(payload)
+
+	if err != nil {
+		logger.Errorf("Failed to identify: %v. Got error: %s", session.gateway, err)
+		return err
+	}
+
+	logger.Debug("Identified to gateway.")
+
+	return nil
 }
 
 type RatelimitedResponse struct {

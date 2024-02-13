@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/log"
 )
 
 type Config struct {
@@ -73,6 +75,12 @@ func initializeConfig() {
 
 	if err != nil {
 		logger.Fatalf("Failed to decode configuration file: %v", err)
+	}
+
+	if config.Debug {
+		logger.SetLevel(log.DebugLevel)
+	} else {
+		logger.SetLevel(log.InfoLevel)
 	}
 
 	getLatestBuild()
