@@ -13,7 +13,6 @@ import (
 var (
 	guilds             = map[string]*Guild{}
 	sessions           = map[string]*Session{}
-	interrupt          = make(chan os.Signal)
 	guildsIndex        = 0
 	sameGuildIntervals = map[string]*time.Time{}
 )
@@ -29,30 +28,50 @@ var logger = log.NewWithOptions(os.Stderr, log.Options{
 func main() {
 	initializeConfig()
 
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-
 	for _, alt := range config.Tokens {
 		session := createClient(alt)
 		sessions[session.Token] = session
 	}
 
 	for _, session := range sessions {
-		go session.Connect()
+		signal.Notify(session.CloseC, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+		go func(s *Session) {
+			s.Connect()
+			<-s.CloseC
+
+			logger.Infof("Closing %v...", strip(s.Token, 35))
+			s.CloseWithCode(1000, true)
+			logger.Infof("Closed.")
+
+			delete(sessions, s.Token)
+		}(session)
 	}
 
-	<-interrupt
+	for {
+		if len(sessions) == 0 {
+			break
+		}
+
+	}
 
 	exit()
 }
 
 func exit() {
-	logger.Infof("Exiting. Terminating %v clients.", len(sessions))
-
-	for _, session := range sessions {
-		session.Close()
+	if len(sessions) != 0 {
+		logger.Infof("Exiting. Terminating %v clients.", len(sessions))
 	}
 
-	logger.Warnf("All connections terminated.")
+	for _, session := range sessions {
+		if session.State != "CLOSED" && session.State != "CLOSING" {
+			session.Close()
+		}
+	}
+
+	if len(sessions) != 0 {
+		logger.Warnf("All connections terminated.")
+	}
 
 	os.Exit(0)
 }

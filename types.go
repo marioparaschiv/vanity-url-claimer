@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"regexp"
 	"sync"
 	"time"
 
@@ -31,10 +30,6 @@ const (
 	HEARTBEAT_ACK         OP = 11
 )
 
-/* RegEx */
-var NITRO_REGEX = regexp.MustCompile(`(discord.gift|discord\.com\/gifts|discordapp\.com\/gifts)\/\w{16,25}`)
-var NITRO_URL_REGEX = regexp.MustCompile(`(discord\.gift\/|discord\.com\/gifts\/|discordapp\.com\/gifts\/)`)
-
 /* Errors */
 var ErrInvalidToken = errors.New("an invalid main token was provided")
 var ErrInvalidPaymentResponse = errors.New("got unexpected response while fetching payment sources")
@@ -44,14 +39,14 @@ var ErrWebsocketAlreadyConnected = errors.New("the websocket is already connecte
 type Session struct {
 	sync.RWMutex
 
-	Token                  string
-	ShouldReconnectOnError bool
-	Dialer                 *websocket.Dialer
-	LastHeartbeatAck       time.Time
-	LastHeartbeatSent      time.Time
-	Identify               IdentifyData
-	State                  string
-	User                   User
+	Token             string
+	Dialer            *websocket.Dialer
+	LastHeartbeatAck  time.Time
+	LastHeartbeatSent time.Time
+	Identify          IdentifyData
+	State             string
+	User              User
+	CloseC            chan os.Signal
 
 	Guilds   map[string]*Guild
 	Vanities map[string]string

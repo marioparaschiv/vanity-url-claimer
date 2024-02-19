@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"slices"
@@ -25,6 +26,7 @@ func createClient(token string) (s *Session) {
 		sequence: new(int64),
 		Guilds:   map[string]*Guild{},
 		Vanities: map[string]string{},
+		CloseC:   make(chan os.Signal),
 		C:        make(chan os.Signal),
 	}
 
@@ -65,6 +67,7 @@ func (session *Session) Connect() error {
 	}
 
 	logger.Infof("Connecting with %v...", strip(session.Token, 35))
+	session.State = "CONNECTING"
 
 	header := http.Header{}
 	header.Add("Accept-Encoding", "json")
@@ -79,26 +82,53 @@ func (session *Session) Connect() error {
 		return err
 	}
 
-	defer session.Close()
-
 	session.websocket.SetCloseHandler(func(code int, text string) error {
+		logger.Warnf("Socket closed with code %v: %v", code, text)
+		session.websocket = nil
 		session.State = "CLOSED"
+
 		session.C <- os.Interrupt
+
+		if code != 4444 {
+			session.CloseC <- os.Interrupt
+		}
 
 		return nil
 	})
 
-	go func() {
+	sequence := atomic.LoadInt64(session.sequence)
+
+	if session.sessionID == "" && sequence == 0 {
+		err = session.identify()
+
+		if err != nil {
+			logger.Errorf("Failed to identify to gateway: %v", err)
+			return err
+		}
+	} else {
+		err = session.resume(sequence)
+
+		if err != nil {
+			logger.Errorf("Failed to resume session: %v. Got error: %s", session.gateway, err)
+			return err
+		}
+	}
+
+	go func(socket *websocket.Conn) {
 		for {
-			if session.State == "CLOSED" || session.State == "CLOSING" {
-				break
+			session.RWMutex.Lock()
+
+			if session.websocket == nil || socket == nil || session.websocket != socket || session.State == "CLOSING" || session.State == "CLOSED" {
+				session.RWMutex.Unlock()
+				return
 			}
 
-			messageType, payload, err := session.websocket.ReadMessage()
+			messageType, payload, err := socket.ReadMessage()
+			session.RWMutex.Unlock()
 
 			if err != nil {
 				logger.Errorf("Received error while reading websocket message: %v", err)
-				continue
+				break
 			}
 
 			err = session.onEvent(messageType, payload)
@@ -107,37 +137,69 @@ func (session *Session) Connect() error {
 				logger.Errorf("Received error while decoding event: %v", err)
 				continue
 			}
-		}
-	}()
 
-	<-session.C
+			select {
+			case <-session.C:
+				return
+			default:
+				if session.websocket == nil || socket == nil || session.websocket != socket || session.State == "CLOSING" || session.State == "CLOSED" {
+					return
+				}
+			}
+		}
+	}(session.websocket)
 
 	return nil
 }
 
 func (session *Session) Close() error {
-	return session.CloseWithCode(websocket.CloseNormalClosure)
+	return session.CloseWithCode(websocket.CloseNormalClosure, false)
 }
 
-func (session *Session) CloseWithCode(code int) error {
-	session.State = "CLOSING"
-
-	err := session.websocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""))
-
-	if err == nil {
-		session.State = "CLOSED"
-		session.C <- os.Interrupt
-
-		delete(sessions, session.Token)
-
-		if len(sessions) == 0 {
-			interrupt <- os.Interrupt
-		}
-	} else {
-		session.State = "CONNECTED"
+func (session *Session) CloseWithCode(code int, force bool) (err error) {
+	if session.State == "CLOSED" || session.State == "CLOSING" {
+		return
 	}
 
-	return err
+	session.Lock()
+	session.State = "CLOSING"
+
+	if session.websocket != nil {
+		err := session.websocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, "The socket was manually closed."))
+
+		if err != nil {
+			logger.Errorf("Failed to close socket: %v", err)
+			session.Unlock()
+			return err
+		}
+
+		err = session.websocket.Close()
+
+		if err != nil {
+			logger.Errorf("Failed to close socket: %v", err)
+			session.Unlock()
+			return err
+		}
+
+		session.websocket = nil
+		session.State = "CLOSED"
+
+		if !force {
+			session.C <- os.Interrupt
+
+			if code != 4444 && !force {
+				session.CloseC <- os.Interrupt
+				logger.Warnf("Socket manually closed with code %v.", code)
+			}
+		}
+
+		session.Unlock()
+		return nil
+	}
+
+	session.Unlock()
+
+	return
 }
 
 func (session *Session) onEvent(messageType int, message []byte) error {
@@ -151,7 +213,8 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		return err
 	}
 
-	atomic.StoreInt64(session.sequence, data.Sequence)
+	// if data.Sequence != nil {
+	// }
 
 	if data.Operation == DISPATCH {
 		if data.Type == "READY" {
@@ -172,7 +235,17 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 				}
 			}
 
+			session.sessionID = event.SessionID
+
 			logger.Infof("Logged in as %v watching %v vanities.", event.User.Username, len(session.Vanities))
+
+			// session.log(LogInformational, "Closing and reconnecting in response to Op7")
+			// go func(s *Session) {
+			// 	time.Sleep(time.Duration(5 * time.Second))
+			// 	logger.Info("reconnecting")
+			// 	s.CloseWithCode(4444)
+			// 	s.reconnect()
+			// }(session)
 		}
 
 		if data.Type == "GUILD_CREATE" {
@@ -278,7 +351,9 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 	if data.Operation == HEARTBEAT {
 		logger.Debugf("Sending heartbeat in response to heartbeat (Sequence: %v)", session.sequence)
 
+		session.RWMutex.Lock()
 		err = session.websocket.WriteJSON(HeartbeatSendEvent{1, atomic.LoadInt64(session.sequence)})
+		session.RWMutex.Unlock()
 
 		if err != nil {
 			logger.Debugf("Failed to send heartbeat: %v", err)
@@ -288,6 +363,16 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		session.LastHeartbeatSent = time.Now().UTC()
 
 		return nil
+	}
+
+	if data.Operation == INVALID_SESSION {
+		logger.Warnf("Got invalid session. Will re-identify.")
+		err := session.identify()
+
+		if err != nil {
+			logger.Infof("Failed to identify during INVALID_SESSION: %v", err)
+			return err
+		}
 	}
 
 	if data.Operation == HELLO {
@@ -301,27 +386,15 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		milliseconds := event.HeartbeatInterval * time.Millisecond
 		session.heartbeatInterval = &milliseconds
 
-		sequence := atomic.LoadInt64(session.sequence)
-
 		session.LastHeartbeatAck = time.Now().UTC()
 
-		if session.sessionID == "" && sequence == 0 {
-			err = session.identify()
+		go session.heartbeat(session.websocket)
+	}
 
-			if err != nil {
-				logger.Errorf("Failed to identify to gateway: %v", err)
-				return err
-			}
-		} else {
-			err = session.resume(sequence)
-
-			if err != nil {
-				logger.Errorf("Failed to resume session: %v. Got error: %s", session.gateway, err)
-				return err
-			}
-		}
-
-		go session.heartbeat()
+	if data.Operation == RECONNECT {
+		logger.Infof("Gateway requested a reconnect.")
+		session.CloseWithCode(4444, false)
+		session.reconnect()
 	}
 
 	if data.Operation == HEARTBEAT_ACK {
@@ -329,31 +402,38 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		logger.Debugf("Heartbeat acknowledged.")
 	}
 
+	atomic.StoreInt64(session.sequence, data.Sequence)
+
 	return nil
 }
 
-func (session *Session) heartbeat() {
+func (session *Session) heartbeat(socket *websocket.Conn) {
 	if session.websocket == nil {
 		return
 	}
 
 	var err error
+
+	time.Sleep(*session.heartbeatInterval)
+
 	ticker := time.NewTicker(*session.heartbeatInterval)
 	defer ticker.Stop()
 
 	for {
-		if session.State == "CLOSED" || session.State == "CLOSING" {
+		if session.websocket == nil || socket == nil || session.websocket != socket || session.State == "CLOSING" || session.State == "CLOSED" {
 			return
 		}
 
 		lastHeartbeat := session.LastHeartbeatAck
-		sequence := atomic.LoadInt64(session.sequence)
 
-		logger.Debugf("Sending gateway websocket heartbeat (Sequence: %d)", sequence)
+		sequence := atomic.LoadInt64(session.sequence)
 
 		session.LastHeartbeatSent = time.Now().UTC()
 		payload := HeartbeatSendEvent{1, sequence}
-		err = session.websocket.WriteJSON(payload)
+
+		logger.Debugf("Sending gateway websocket heartbeat (Sequence: %d)", sequence)
+		err = socket.WriteJSON(payload)
+
 		atomic.AddInt64(session.sequence, 1)
 
 		if err != nil || time.Now().UTC().Sub(lastHeartbeat) > ((*session.heartbeatInterval)*(FAILED_HEARTBEAT_ACKS)) {
@@ -380,31 +460,29 @@ func (session *Session) heartbeat() {
 func (session *Session) reconnect() {
 	var err error
 
-	if session.ShouldReconnectOnError {
-		wait := time.Duration(1)
+	wait := time.Duration(1)
 
-		for {
-			logger.Info("Attempting to reconnect to gateway.")
+	for {
+		logger.Info("Attempting to reconnect to gateway.")
 
-			err = session.Connect()
-			if err == nil {
-				logger.Info("Successfully reconnected to gateway.")
-				return
-			}
+		err = session.Connect()
+		if err == nil {
+			logger.Info("Successfully reconnected to gateway.")
+			return
+		}
 
-			if err == ErrWebsocketAlreadyConnected {
-				logger.Info("WebSocket already exists, no need to reconnect")
-				return
-			}
+		if err == ErrWebsocketAlreadyConnected {
+			logger.Info("WebSocket already exists, no need to reconnect")
+			return
+		}
 
-			logger.Errorf("Failed to reconnect to gateway: %v", err)
+		logger.Errorf("Failed to reconnect to gateway: %v", err)
 
-			<-time.After(wait * time.Second)
-			wait *= 2
+		<-time.After(wait * time.Second)
+		wait *= 2
 
-			if wait > 600 {
-				wait = 600
-			}
+		if wait > 600 {
+			wait = 600
 		}
 	}
 }
@@ -421,7 +499,9 @@ func (session *Session) resume(sequence int64) error {
 
 	logger.Infof("Attempting to resume session: %v", session.sessionID)
 
+	session.RWMutex.Lock()
 	err := session.websocket.WriteJSON(payload)
+	session.RWMutex.Unlock()
 
 	if err != nil {
 		logger.Errorf("Failed to resume session: %v. Got error: %s", session.gateway, err)
@@ -442,7 +522,10 @@ func (session *Session) identify() error {
 	payload.Data = session.Identify
 
 	logger.Debug("Attempting to identify to gateway.")
+
+	session.RWMutex.Lock()
 	err := session.websocket.WriteJSON(payload)
+	session.RWMutex.Unlock()
 
 	if err != nil {
 		logger.Errorf("Failed to identify: %v. Got error: %s", session.gateway, err)
@@ -573,7 +656,7 @@ func snipe(vanity string, token string, tries int) {
 				guildsIndex = 0
 			} else {
 				logger.Warnf("Ran out of guilds to use. as config.rotateGuilds is turned off, the process will now exit.")
-				exit()
+				os.Exit(-1)
 			}
 		}
 	}
