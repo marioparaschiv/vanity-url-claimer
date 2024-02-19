@@ -281,7 +281,7 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 			if event.VanityURLCode != session.Vanities[event.ID] {
 				_, exists := session.Vanities[event.ID]
 
-				if session.Vanities[event.ID] == "" {
+				if !exists || session.Vanities[event.ID] == "" {
 					return nil
 				}
 
