@@ -8,13 +8,16 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
+	jsoniter "github.com/json-iterator/go"
 )
 
 var (
 	guilds             = map[string]*Guild{}
 	sessions           = map[string]*Session{}
+	sniping            = map[string]bool{}
 	guildsIndex        = 0
 	sameGuildIntervals = map[string]*time.Time{}
+	json               = jsoniter.ConfigCompatibleWithStandardLibrary
 )
 
 var logger = log.NewWithOptions(os.Stderr, log.Options{

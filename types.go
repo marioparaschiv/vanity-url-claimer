@@ -1,11 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"sync"
 	"time"
+
+	_json "encoding/json"
 
 	"github.com/gorilla/websocket"
 )
@@ -47,10 +48,10 @@ type Session struct {
 	State             string
 	User              User
 	CloseC            chan os.Signal
+	Reconnecting      bool
 
 	Guilds   map[string]*Guild
 	Vanities map[string]string
-	// Channels map[string]*Channel
 
 	websocket         *websocket.Conn
 	heartbeatInterval *time.Duration
@@ -80,10 +81,10 @@ type Channel struct {
 
 /* Events */
 type Event struct {
-	Operation OP              `json:"op"`
-	Sequence  int64           `json:"s"`
-	Type      string          `json:"t"`
-	RawData   json.RawMessage `json:"d"`
+	Operation OP               `json:"op"`
+	Sequence  int64            `json:"s"`
+	Type      string           `json:"t"`
+	RawData   _json.RawMessage `json:"d"`
 }
 
 type HeartbeatSendEvent struct {

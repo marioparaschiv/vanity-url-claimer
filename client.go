@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,7 +65,12 @@ func (session *Session) Connect() error {
 		return ErrWebsocketAlreadyConnected
 	}
 
-	logger.Infof("Connecting with %v...", strip(session.Token, 35))
+	if session.Reconnecting {
+		logger.Debugf("Reconnecting with %v...", strip(session.Token, 35))
+	} else {
+		logger.Infof("Connecting with %v...", strip(session.Token, 35))
+	}
+
 	session.State = "CONNECTING"
 
 	header := http.Header{}
@@ -91,6 +95,7 @@ func (session *Session) Connect() error {
 
 		if code != 4444 {
 			session.CloseC <- os.Interrupt
+			session.reconnect()
 		}
 
 		return nil
@@ -157,20 +162,20 @@ func (session *Session) Close() error {
 }
 
 func (session *Session) CloseWithCode(code int, force bool) (err error) {
+	session.Lock()
+
 	if session.State == "CLOSED" || session.State == "CLOSING" {
+		session.Unlock()
 		return
 	}
 
-	session.Lock()
 	session.State = "CLOSING"
 
 	if session.websocket != nil {
 		err := session.websocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, "The socket was manually closed."))
 
 		if err != nil {
-			logger.Errorf("Failed to close socket: %v", err)
-			session.Unlock()
-			return err
+			logger.Debugf("Failed to cleanly close socket: %v", err)
 		}
 
 		err = session.websocket.Close()
@@ -213,9 +218,6 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		return err
 	}
 
-	// if data.Sequence != nil {
-	// }
-
 	if data.Operation == DISPATCH {
 		if data.Type == "READY" {
 			session.State = "CONNECTED"
@@ -230,7 +232,7 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 				guilds[guild.ID] = &guild
 
 				if guild.VanityURLCode != "" {
-					logger.Infof("Queued %v for sniping. (Vanity: %v)", guild.Name, guild.VanityURLCode)
+					logger.Debugf("Queued %v for sniping. (Vanity: %v)", guild.Name, guild.VanityURLCode)
 					session.Vanities[guild.ID] = guild.VanityURLCode
 				}
 			}
@@ -238,14 +240,6 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 			session.sessionID = event.SessionID
 
 			logger.Infof("Logged in as %v watching %v vanities.", event.User.Username, len(session.Vanities))
-
-			// session.log(LogInformational, "Closing and reconnecting in response to Op7")
-			// go func(s *Session) {
-			// 	time.Sleep(time.Duration(5 * time.Second))
-			// 	logger.Info("reconnecting")
-			// 	s.CloseWithCode(4444)
-			// 	s.reconnect()
-			// }(session)
 		}
 
 		if data.Type == "GUILD_CREATE" {
@@ -275,6 +269,7 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 			}
 
 			if config.IgnoreHostGuilds && slices.Contains(config.Guilds, event.ID) {
+				logger.Infof("ignoring guild as its in host guilds")
 				return nil
 			}
 
@@ -344,7 +339,7 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 		}
 
 		if data.Type == "RESUMED" {
-			logger.Infof("Logged in by resuming old session with %v guilds", len(guilds))
+			logger.Debugf("Resumed old session %v with %v guilds", session.sessionID, len(guilds))
 		}
 	}
 
@@ -366,7 +361,7 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 	}
 
 	if data.Operation == INVALID_SESSION {
-		logger.Warnf("Got invalid session. Will re-identify.")
+		logger.Debug("Got invalid session. Will re-identify.")
 		err := session.identify()
 
 		if err != nil {
@@ -392,7 +387,8 @@ func (session *Session) onEvent(messageType int, message []byte) error {
 	}
 
 	if data.Operation == RECONNECT {
-		logger.Infof("Gateway requested a reconnect.")
+		session.Reconnecting = true
+		logger.Debugf("Gateway requested a reconnect.")
 		session.CloseWithCode(4444, false)
 		session.reconnect()
 	}
@@ -463,11 +459,20 @@ func (session *Session) reconnect() {
 	wait := time.Duration(1)
 
 	for {
-		logger.Info("Attempting to reconnect to gateway.")
+		if session.Reconnecting {
+			logger.Debug("Attempting to reconnect to gateway.")
+		} else {
+			logger.Info("Attempting to reconnect to gateway.")
+		}
 
 		err = session.Connect()
 		if err == nil {
-			logger.Info("Successfully reconnected to gateway.")
+			if session.Reconnecting {
+				logger.Debug("Successfully reconnected to gateway.")
+				session.Reconnecting = true
+			} else {
+				logger.Info("Successfully reconnected to gateway.")
+			}
 			return
 		}
 
@@ -497,9 +502,8 @@ func (session *Session) resume(sequence int64) error {
 	payload.Data.SessionID = session.sessionID
 	payload.Data.Sequence = sequence
 
-	logger.Infof("Attempting to resume session: %v", session.sessionID)
-
 	session.RWMutex.Lock()
+	logger.Debugf("Attempting to resume session: %v", session.sessionID)
 	err := session.websocket.WriteJSON(payload)
 	session.RWMutex.Unlock()
 
@@ -521,9 +525,8 @@ func (session *Session) identify() error {
 	payload.Op = 2
 	payload.Data = session.Identify
 
-	logger.Debug("Attempting to identify to gateway.")
-
 	session.RWMutex.Lock()
+	logger.Debug("Attempting to identify to gateway.")
 	err := session.websocket.WriteJSON(payload)
 	session.RWMutex.Unlock()
 
@@ -554,6 +557,11 @@ type FailedResponse struct {
 }
 
 func snipe(vanity string, token string, tries int) {
+	if sniping[vanity] {
+		return
+	}
+
+	sniping[vanity] = true
 	logger.Infof("Attempting to snipe vanity: %v", vanity)
 
 	payload, err := json.Marshal(map[string]string{"code": vanity})
@@ -569,6 +577,7 @@ func snipe(vanity string, token string, tries int) {
 
 	if err != nil {
 		logger.Errorf("Failed to make request: %v", err)
+		delete(sniping, vanity)
 		return
 	}
 
@@ -583,6 +592,7 @@ func snipe(vanity string, token string, tries int) {
 
 	if err != nil {
 		logger.Errorf("Failed to complete request: %v", err)
+		delete(sniping, vanity)
 		return
 	}
 
@@ -592,6 +602,7 @@ func snipe(vanity string, token string, tries int) {
 
 	if err != nil {
 		logger.Errorf("Failed to decode body: %v", err)
+		delete(sniping, vanity)
 		return
 	}
 
@@ -607,6 +618,8 @@ func snipe(vanity string, token string, tries int) {
 
 		logger.Warnf("Ratelimited for %v while trying to snipe vanity: %v (Time: %.2fs)", ratelimit, vanity, elapsed.Seconds())
 		time.Sleep(ratelimit)
+
+		delete(sniping, vanity)
 
 		if config.Retries > tries {
 			tries += 1
@@ -627,6 +640,8 @@ func snipe(vanity string, token string, tries int) {
 		if err != nil {
 			logger.Errorf("Failed to unmarshall body: %v", err)
 		}
+
+		delete(sniping, vanity)
 
 		logger.Warnf("Failed to snipe vanity: %v (Reason: %v, Time: %.2fs)", vanity, jsonBody.Message, elapsed.Seconds())
 		return
@@ -650,6 +665,8 @@ func snipe(vanity string, token string, tries int) {
 			sameGuildIntervals[guild] = &date
 		}
 
+		delete(sniping, vanity)
+
 		if guildsIndex >= (len(config.Guilds) - 1) {
 			if config.RotateGuilds {
 				logger.Warnf("Used up all available guilds for vanity sniping. As rotate guilds is turned on, we will re-use them in order.")
@@ -661,5 +678,6 @@ func snipe(vanity string, token string, tries int) {
 		}
 	}
 
+	delete(sniping, vanity)
 	logger.Warnf("Got unknown response code. (Status: %v, Body: %v)", res.StatusCode, string(body))
 }
