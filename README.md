@@ -1,5 +1,5 @@
-# Vanity Sniper
-Listens for vanity changes on configured alt accounts and attempts to snipe them to configured servers.
+# Vanity URL Claimer
+Listens for vanity changes on configured alt accounts and attempts to claim them to configured servers.
 
 # Building
 - Clone the project
